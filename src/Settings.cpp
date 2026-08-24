@@ -121,6 +121,12 @@ bool CSettings::Load()
     return false;
   }
 
+  if (!kodi::addon::CheckSettingBoolean("streamdiagnostics", m_logStreamDiagnostics))
+  {
+    kodi::Log(ADDON_LOG_ERROR, "Couldn't get 'streamdiagnostics' setting");
+    return false;
+  }
+
   if (!kodi::addon::CheckSettingString("genericaccesstoken", m_Generic_AccessToken))
   {
     /* If setting is unknown fallback to defaults */

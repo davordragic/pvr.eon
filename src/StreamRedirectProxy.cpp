@@ -14,6 +14,7 @@
 
 #include <kodi/General.h>
 
+#include <chrono>
 #include <cstring>
 #include <sstream>
 
@@ -70,13 +71,29 @@ bool GetQueryParam(const std::string& request, const std::string& name, long lon
 const std::string kPlayer = "m3u8";
 const std::string kConnTypeEthernet = "ETHERNET";
 const std::string kConnTypeBrowser = "BROWSER";
+// How old a measured backend/device clock offset may be before this falls back
+// to asking the backend again. Well inside the ~20s freshness the CDN wants,
+// even for a clock drifting far worse than a real one does.
+constexpr int64_t SERVER_TIME_OFFSET_MAX_AGE_MS = 60 * 60 * 1000;
 
-// The CDN rejects an encrypted URL if its embedded ctime is more than
-// ~20 seconds old, so this must be fetched fresh for every seek -- mirrors
-// CPVREon::GetTime(), which the non-proxy path calls for every request.
+// The ctime a seek URL embeds has to be current -- the CDN rejects one more
+// than ~20 seconds old -- but current is not the same as freshly fetched: the
+// device clock plus the backend's measured offset is just as present-tense,
+// and costs no round trip. Only a stream whose offset was never measured, or
+// was measured long enough ago that drift is worth worrying about, pays for
+// the request. Mirrors CPVREon::GetTime().
 std::string FetchServerTime(const StreamParams& params)
 {
-  const int64_t fallbackMs = static_cast<int64_t>(time(nullptr)) * 1000;
+  const int64_t deviceMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                               std::chrono::system_clock::now().time_since_epoch())
+                               .count();
+  if (params.serverTimeKnown &&
+      deviceMs - params.serverTimeMeasuredAtMs < SERVER_TIME_OFFSET_MAX_AGE_MS)
+  {
+    return std::to_string(deviceMs + params.serverTimeOffsetMs);
+  }
+
+  const int64_t fallbackMs = deviceMs;
   if (params.apiTimeUrl.empty())
     return std::to_string(fallbackMs);
 

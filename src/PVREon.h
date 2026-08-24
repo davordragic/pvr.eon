@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -294,6 +295,25 @@ private:
   // its own (catchup) or whether it still needs our own estimate (timeshift).
   bool m_live_using_catchup = false;
   StreamRedirectProxy m_redirectProxy;
+
+  // Offset between the backend's clock and this device's, in milliseconds
+  // (backend - device), and when it was last measured. Stream URLs embed a
+  // ctime the CDN wants within ~20s of real time, which an offset satisfies
+  // just as well as a fresh reading -- see GetTime().
+  int64_t m_server_time_offset_ms = 0;
+  int64_t m_server_time_synced_at_ms = 0;
+  bool m_server_time_synced = false;
+
+  // Last known airtime of the programme currently on each channel, keyed by
+  // channel uid. Valid by construction only while that programme is still
+  // running, which is exactly when tuning in wants it -- see
+  // GetChannelStreamProperties().
+  struct EonAiringProgramme
+  {
+    time_t startTime = 0;
+    time_t endTime = 0;
+  };
+  std::map<int, EonAiringProgramme> m_airing_programmes;
 
   std::string m_service_provider;
   std::string m_support_web;

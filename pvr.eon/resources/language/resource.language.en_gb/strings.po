@@ -252,6 +252,9 @@ msgctxt "#30061"
 msgid "Lowest bitrate"
 msgstr ""
 
+msgctxt "#30062"
+msgid "Log stream diagnostics"
+msgstr ""
 
 msgctxt "#30500"
 msgid "Inputstream error"

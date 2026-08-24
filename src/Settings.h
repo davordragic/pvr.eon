@@ -45,6 +45,9 @@ public:
   const bool IsGroupsenabled() const  { return m_enablegroups; }
   const bool UseShortNames() const  { return m_shortnames; }
   const bool UseExperimentalNativeStream() const { return m_experimentalNativeStream; }
+  // Fetches the manifest (and its first variant) purely to log what the
+  // backend served, so it is off unless someone is chasing a stream problem.
+  const bool LogStreamDiagnostics() const { return m_logStreamDiagnostics; }
 
 private:
   int m_eonServiceProvider;
@@ -73,4 +76,5 @@ private:
   bool m_enablegroups;
   bool m_shortnames;
   bool m_experimentalNativeStream;
+  bool m_logStreamDiagnostics;
 };

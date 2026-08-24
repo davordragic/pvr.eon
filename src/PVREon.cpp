@@ -13,6 +13,7 @@
 #include <array>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <thread>
 
@@ -42,7 +43,20 @@ constexpr time_t NATIVE_SEEK_RESTART_EPSILON_SECONDS = 2;
 constexpr time_t NATIVE_LIVE_EDGE_DELAY_SECONDS = 15;
 constexpr int64_t NATIVE_INITIAL_SEEK_IGNORE_WINDOW_MS = 4000;
 constexpr int NATIVE_POLL_RETRY_COUNT = 10;
+// How long a measured backend/device clock offset is trusted before it is
+// measured again. Clock drift over this span is orders of magnitude below the
+// ~20s freshness the CDN requires of a ctime.
+constexpr int64_t SERVER_TIME_RESYNC_INTERVAL_MS = 15 * 60 * 1000;
 constexpr auto NATIVE_POLL_RETRY_DELAY = std::chrono::milliseconds(200);
+
+// v1/time is answered in milliseconds since the epoch, so the device clock has
+// to be read at the same resolution to compare the two (see CPVREon::GetTime).
+int64_t DeviceTimeMs()
+{
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+             std::chrono::system_clock::now().time_since_epoch())
+      .count();
+}
 
 int64_t MonotonicNowMs()
 {
@@ -620,15 +634,44 @@ bool CPVREon::GetHouseholds()
 
 std::string CPVREon::GetTime()
 {
+  // Every stream URL built for playback or for a seek embeds a ctime, and the
+  // CDN only cares that it is within ~20s of real time. What that needs is the
+  // *offset* between the backend's clock and this device's, not a fresh
+  // reading -- so measure the offset occasionally and mint ctime locally. That
+  // takes one blocking round trip out of every channel start and every seek.
+  if (m_server_time_synced &&
+      DeviceTimeMs() - m_server_time_synced_at_ms < SERVER_TIME_RESYNC_INTERVAL_MS)
+  {
+    return std::to_string(DeviceTimeMs() + m_server_time_offset_ms);
+  }
+
   std::string url = m_api + "v1/time";
 
   rapidjson::Document doc;
   if (!GetPostJson(url, "", doc)) {
     kodi::Log(ADDON_LOG_ERROR, "Failed to get time");
+    // An offset measured a while ago still beats no ctime at all; only a
+    // device that has never reached v1/time has nothing to fall back on.
+    if (m_server_time_synced)
+      return std::to_string(DeviceTimeMs() + m_server_time_offset_ms);
     return "";
   }
 
-  return Utils::JsonStringOrEmpty(doc, "time");
+  const std::string serverTime = Utils::JsonStringOrEmpty(doc, "time");
+  const int64_t serverTimeMs = serverTime.empty() ? 0 : std::strtoll(serverTime.c_str(), nullptr, 10);
+  if (serverTimeMs > 0)
+  {
+    const int64_t deviceTimeMs = DeviceTimeMs();
+    const int64_t offsetMs = serverTimeMs - deviceTimeMs;
+    if (!m_server_time_synced || std::llabs(offsetMs - m_server_time_offset_ms) > 1000)
+      kodi::Log(ADDON_LOG_INFO, "Backend clock is %lld ms ahead of this device",
+                static_cast<long long>(offsetMs));
+    m_server_time_offset_ms = offsetMs;
+    m_server_time_synced_at_ms = deviceTimeMs;
+    m_server_time_synced = true;
+  }
+
+  return serverTime;
 }
 
 bool CPVREon::GetServiceProvider()
@@ -2130,7 +2173,11 @@ PVR_ERROR CPVREon::GetStreamProperties(
               static_cast<long long>(starttime),
               static_cast<long long>(endtime));
     EonPlaybackUrlResult playback;
-    if (!BuildPlaybackUrl(channel, starttime, endtime, isLive, playback, true))
+    // Diagnostics cost two blocking manifest fetches before playback can even
+    // start, which is a lot to pay on every channel start for log lines nobody
+    // is reading unless they are chasing a stream problem.
+    if (!BuildPlaybackUrl(channel, starttime, endtime, isLive, playback,
+                          m_settings->LogStreamDiagnostics()))
       return PVR_ERROR_SERVER_ERROR;
 
     bool catchupProxyReady = false;
@@ -2155,9 +2202,17 @@ PVR_ERROR CPVREon::GetStreamProperties(
       sp.aaEnabled = channel.aaEnabled;
       sp.platform = m_platform;
       sp.maxBitrate = static_cast<unsigned int>(playback.bitrate);
-      // The CDN rejects a stale ctime (>~20s old), so the proxy fetches
-      // this fresh for every seek rather than relying on a cached offset.
+      // Kept as the fallback for when the offset below is unknown or too old
+      // to trust; a seek that has to fetch this first is a seek that waits on
+      // a round trip before it can even mint its URL.
       sp.apiTimeUrl = m_api + "v1/time";
+      // The CDN rejects a stale ctime (>~20s old), but an offset plus the
+      // device clock yields a current timestamp, not a stale one -- see
+      // GetTime(), which measures it and is always called by BuildPlaybackUrl
+      // just above.
+      sp.serverTimeOffsetMs = m_server_time_offset_ms;
+      sp.serverTimeMeasuredAtMs = m_server_time_synced_at_ms;
+      sp.serverTimeKnown = m_server_time_synced;
       sp.accessToken = m_settings->GetEonAccessToken();
       sp.userAgent = EonParameters[m_platform].user_agent;
       sp.qualityPreference = m_settings->GetFfmpegdirectQuality();
@@ -2244,24 +2299,45 @@ PVR_ERROR CPVREon::GetChannelStreamProperties(
       // show (not just what ffmpegdirect's local timeshift buffer has
       // captured since tune-in), and as the progress bar range.
       const time_t now = time(nullptr);
-      const std::string epgUrl = m_api + "v1/events/epg" +
-                                 "?cid=" + std::to_string(addonChannel.iUniqueId) +
-                                 "&fromTime=" + std::to_string(now) + "000" +
-                                 "&toTime=" + std::to_string(now + 1) + "000";
-      // Best-effort only: already has a graceful fallback below (falls back
-      // to stream_mode=timeshift if this fails) -- a modal error dialog for
-      // a transient/unrelated backend hiccup on live channel tune-in would
-      // be a jarring false alarm, not something the user needs to act on.
-      rapidjson::Document epgDoc;
-      if (GetPostJson(epgUrl, "", epgDoc, false))
+
+      // The answer only changes when the programme does, so a remembered one
+      // is still correct for as long as that programme is on air -- and
+      // channel flipping revisits the same channels constantly. Reusing it
+      // keeps a blocking round trip out of the tune-in path entirely.
+      const auto airing = m_airing_programmes.find(addonChannel.iUniqueId);
+      if (airing != m_airing_programmes.end() && now >= airing->second.startTime &&
+          now < airing->second.endTime)
       {
-        const std::string cid = std::to_string(addonChannel.iUniqueId);
-        if (epgDoc.HasMember(cid.c_str()) && epgDoc[cid.c_str()].IsArray() &&
-            epgDoc[cid.c_str()].Size() > 0)
+        m_stream_start_time = airing->second.startTime;
+        m_stream_end_time = airing->second.endTime;
+        kodi::Log(ADDON_LOG_DEBUG,
+                  "Reusing known airing programme for channel uid=%i start=%lld end=%lld",
+                  addonChannel.iUniqueId, static_cast<long long>(m_stream_start_time),
+                  static_cast<long long>(m_stream_end_time));
+      }
+      else
+      {
+        const std::string epgUrl = m_api + "v1/events/epg" +
+                                   "?cid=" + std::to_string(addonChannel.iUniqueId) +
+                                   "&fromTime=" + std::to_string(now) + "000" +
+                                   "&toTime=" + std::to_string(now + 1) + "000";
+        // Best-effort only: already has a graceful fallback below (falls back
+        // to stream_mode=timeshift if this fails) -- a modal error dialog for
+        // a transient/unrelated backend hiccup on live channel tune-in would
+        // be a jarring false alarm, not something the user needs to act on.
+        rapidjson::Document epgDoc;
+        if (GetPostJson(epgUrl, "", epgDoc, false))
         {
-          const rapidjson::Value& epgItem = epgDoc[cid.c_str()][0];
-          m_stream_start_time = (time_t)(Utils::JsonInt64OrZero(epgItem, "startTime") / 1000);
-          m_stream_end_time = (time_t)(Utils::JsonInt64OrZero(epgItem, "endTime") / 1000);
+          const std::string cid = std::to_string(addonChannel.iUniqueId);
+          if (epgDoc.HasMember(cid.c_str()) && epgDoc[cid.c_str()].IsArray() &&
+              epgDoc[cid.c_str()].Size() > 0)
+          {
+            const rapidjson::Value& epgItem = epgDoc[cid.c_str()][0];
+            m_stream_start_time = (time_t)(Utils::JsonInt64OrZero(epgItem, "startTime") / 1000);
+            m_stream_end_time = (time_t)(Utils::JsonInt64OrZero(epgItem, "endTime") / 1000);
+            if (m_stream_start_time > 0 && m_stream_end_time > now)
+              m_airing_programmes[addonChannel.iUniqueId] = {m_stream_start_time, m_stream_end_time};
+          }
         }
       }
 

@@ -32,12 +32,17 @@ struct StreamParams
   bool aaEnabled = false;
   int platform = 0;
   unsigned int maxBitrate = 0;
-  // Used to fetch a fresh ctime for every seek (see BuildEncryptedUrl) --
-  // the CDN rejects an encrypted URL if its embedded ctime is more than
-  // ~20 seconds old, so a cached device-clock-relative offset isn't
-  // reliable enough; matches how the non-proxy path calls this API fresh
-  // for every request.
+  // Fallback source for the ctime every seek URL embeds (see
+  // BuildEncryptedUrl), used only when the offset below is unknown or stale.
   std::string apiTimeUrl;
+  // Difference between the backend clock and this device's, as last measured
+  // by CPVREon::GetTime(). The CDN rejects an encrypted URL whose ctime is
+  // more than ~20 seconds old, which this satisfies: the offset is applied to
+  // the current device clock, so the result is a present-tense timestamp, and
+  // it is re-measured often enough that drift stays far inside that window.
+  int64_t serverTimeOffsetMs = 0;
+  int64_t serverTimeMeasuredAtMs = 0;
+  bool serverTimeKnown = false;
   std::string accessToken;
   // Sent as the User-Agent for the proxy's own HTTP calls (time fetch,
   // verify-fetch) -- the CDN blocks requests missing a recognized

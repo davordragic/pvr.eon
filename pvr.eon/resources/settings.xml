@@ -222,6 +222,13 @@
           </constraints>
           <control type="list" format="integer" />
         </setting>
+        <!-- Off by default because it costs two blocking manifest fetches
+             before playback starts, on every channel change. -->
+        <setting id="streamdiagnostics" type="boolean" label="30062">
+          <level>2</level>
+          <default>false</default>
+          <control type="toggle" />
+        </setting>
         <setting id="experimentalnativestream" type="boolean" label="30057">
           <level>0</level>
           <default>false</default>
