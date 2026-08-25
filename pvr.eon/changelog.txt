@@ -1,3 +1,11 @@
+v21.8.8
+  - A programme played from the guide now shows its own length. It was being
+    presented with the timeline live TV gets -- from the programme's start
+    until now -- so a 30-minute episode that aired six hours ago read as
+    00:06:16 / 06:19:24 with the progress bar barely off its left edge. A
+    programme that is still on air keeps growing as before, and playback still
+    carries on past a finished programme into whatever airs next
+
 v21.8.7
   - Fix live rewind being unavailable on the first channel played after opening
     Kodi. The first request made once the stored access token has expired comes

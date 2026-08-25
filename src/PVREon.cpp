@@ -1215,15 +1215,21 @@ void CPVREon::SetStreamProperties(std::vector<kodi::addon::PVRStreamProperty>& p
       // growing with real time instead of capping it at the programme's
       // (possibly still in the future) end time.
       properties.emplace_back("inputstream.ffmpegdirect.stream_mode", "catchup");
-      // playForwardIndefinitely: a specific past programme selected from the
-      // guide (see GetEPGTagStreamProperties) -- it must start at ITS OWN
-      // beginning (isLive=false keeps BuildPlaybackUrl and
-      // catchup_buffer_offset targeting starttime, not "now"), but the
-      // underlying feed keeps extending past this programme's nominal end
-      // into whatever airs next, so the seekable end needs to keep growing
-      // with real time exactly like live does, not freeze at endtime.
+      // playback_as_live is the only thing that decides what ffmpegdirect
+      // reports as the stream's length: on it means "start of the buffer
+      // until now", off means "until the buffer's end time, or now if that
+      // has not arrived yet". Live wants the first -- the programme is still
+      // being broadcast, so its timeline grows. A past programme selected
+      // from the guide wants the second, and used to get the first: a
+      // 30-minute episode that aired six hours ago was presented as a
+      // six-hour stream with the progress bar barely off its left edge.
+      // Turning it off costs nothing on the way in (a programme still on air
+      // has now < endtime, so its timeline still grows exactly as it should)
+      // and nothing on the way out either: the seekable range ffmpegdirect
+      // enforces comes from the buffer start and real time, not from this,
+      // so the feed still plays on past the programme's end.
       properties.emplace_back("inputstream.ffmpegdirect.playback_as_live",
-                               (isLive || playForwardIndefinitely) ? "true" : "false");
+                               isLive ? "true" : "false");
       properties.emplace_back("inputstream.ffmpegdirect.programme_start_time", std::to_string(starttime));
       properties.emplace_back("inputstream.ffmpegdirect.programme_end_time", std::to_string(endtime));
       properties.emplace_back("inputstream.ffmpegdirect.catchup_buffer_start_time", std::to_string(starttime));
@@ -2087,18 +2093,16 @@ PVR_ERROR CPVREon::GetEPGTagStreamProperties(
       // -- EON's replay/catchup manifest never sets #EXT-X-ENDLIST, so it
       // is a continuously-extending feed that carries on into whatever airs
       // next rather than a finite recording. Stale title text is a far
-      // smaller problem than being unable to return to live, and
-      // playForwardIndefinitely below keeps the timeline itself correct
-      // across that transition.
+      // smaller problem than being unable to return to live.
       m_stream_is_live = false;
       m_stream_start_time = tag.GetStartTime();
       m_stream_end_time = tag.GetEndTime();
 
       // playForwardIndefinitely: the underlying feed keeps extending past
-      // this programme's nominal end, so the seekable end has to keep
-      // growing with real time instead of freezing at endtime (see
-      // SetStreamProperties), otherwise progress and seeking break the
-      // moment playback continues into the next programme.
+      // this programme's nominal end into whatever airs next, so this is not
+      // a finite recording that should stop there -- see GetStreamProperties,
+      // which uses it to keep reporting the growing catchup-mode times rather
+      // than an estimate of its own that would end with the programme.
       return GetStreamProperties(channel, properties, tag.GetStartTime(), tag.GetEndTime(),
                                  /*isLive=*/false, /*playForwardIndefinitely=*/true);
     }
