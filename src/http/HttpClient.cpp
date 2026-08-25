@@ -23,6 +23,21 @@ std::string DescribeSecret(const std::string& value)
   return value.empty() ? "empty" : "set(len=" + std::to_string(value.size()) + ")";
 }
 
+// Every request needs these regardless of which token ends up on it, so the
+// retry that follows a 401 has to set them too -- it builds a fresh Curl and
+// would otherwise send only an Authorization header. The EPG endpoint made
+// that visible: without x-ucp-time-format it reads fromTime/toTime as
+// formatted dates rather than epoch milliseconds and answers HTTP 400
+// invalid_input, so the first tune-in after a token expiry lost its programme
+// window and fell back to a live stream with no rewind.
+void AddRequestHeaders(Curl& curl, const std::string& url)
+{
+  curl.AddHeader("User-Agent", EON_USER_AGENT);
+  curl.AddHeader("Content-Type", "application/json");
+  if (url.find("/events/epg") != std::string::npos)
+    curl.AddHeader("x-ucp-time-format", "timestamp");
+}
+
 std::string PreviewForLog(std::string value)
 {
   std::replace(value.begin(), value.end(), '\n', ' ');
@@ -388,7 +403,7 @@ std::string HttpClient::HttpRequest(const std::string& action, const std::string
   std::string access_token;
   std::string auth_mode;
 
-  curl.AddHeader("User-Agent", EON_USER_AGENT);
+  AddRequestHeaders(curl, url);
 
   size_t found = url.find(m_supportApi);
   if (found != std::string::npos) {
@@ -416,12 +431,6 @@ std::string HttpClient::HttpRequest(const std::string& action, const std::string
       curl.AddHeader("Authorization", "Basic " + base64_encode(basic_token.c_str(), basic_token.length()));
     }
   }
-  curl.AddHeader("Content-Type", "application/json");
-
-  found = url.find("/events/epg");
-  if (found != std::string::npos) {
-    curl.AddHeader("x-ucp-time-format", "timestamp");
-  }
 
   std::string content = HttpRequestToCurl(curl, action, url, postData, statusCode);
 
@@ -430,6 +439,7 @@ std::string HttpClient::HttpRequest(const std::string& action, const std::string
               "HTTP 401 for %s %s. auth=%s payloadLen=%zu, attempting token refresh.",
               action.c_str(), url.c_str(), auth_mode.c_str(), postData.size());
     Curl curl_reauth;
+    AddRequestHeaders(curl_reauth, url);
     size_t found = url.find(m_supportApi);
     bool refresh_successful = true;
     std::string retry_auth_mode;
