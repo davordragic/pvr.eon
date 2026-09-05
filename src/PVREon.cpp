@@ -934,6 +934,7 @@ CPVREon::CPVREon() :
 
 CPVREon::~CPVREon()
 {
+  StopEpgPrefetch();
   m_channels.clear();
 }
 
@@ -1910,101 +1911,387 @@ PVR_ERROR CPVREon::GetDriveSpace(uint64_t& total, uint64_t& used)
   return PVR_ERROR_NO_ERROR;
 }
 
+EonEpgEntry CPVREon::ParseEpgEntry(const rapidjson::Value& epgItem) const
+{
+  EonEpgEntry entry;
+
+  entry.broadcastId = Utils::JsonIntOrZero(epgItem, "id");
+  entry.title = Utils::JsonStringOrEmpty(epgItem, "title");
+  entry.originalTitle = Utils::JsonStringOrEmpty(epgItem, "originalTitle");
+  entry.startTime = (time_t)(Utils::JsonInt64OrZero(epgItem, "startTime") / 1000);
+  entry.endTime = (time_t)(Utils::JsonInt64OrZero(epgItem, "endTime") / 1000);
+  entry.plot = Utils::JsonStringOrEmpty(epgItem, "shortDescription");
+  entry.seriesNumber = Utils::JsonIntOrZero(epgItem, "seasonNumber");
+  entry.episodeNumber = Utils::JsonIntOrZero(epgItem, "episodeNumber");
+  if (entry.episodeNumber != 0)
+    entry.flags += EPG_TAG_FLAG_IS_SERIES;
+
+  try {
+    entry.parentalRating = std::stoi(Utils::JsonStringOrEmpty(epgItem, "ageRating"));
+  } catch (std::invalid_argument&e) {
+
+  }
+
+  if (Utils::JsonBoolOrFalse(epgItem, "liveBroadcast"))
+    entry.flags += EPG_TAG_FLAG_IS_LIVE;
+
+  if (epgItem.HasMember("images") && epgItem["images"].IsArray())
+  {
+    const rapidjson::Value& images = epgItem["images"];
+    for (rapidjson::Value::ConstValueIterator itr = images.Begin(); itr != images.End(); ++itr)
+    {
+      if (Utils::JsonStringOrEmpty(*itr, "size") == "STB_XL")
+        entry.iconPath = m_images_api + Utils::JsonStringOrEmpty(*itr, "path");
+    }
+  }
+
+  return entry;
+}
+
+// Fetches the guide for one batch of channels. Up to EPG_CHANNELS_PER_REQUEST
+// ids go into a single request; the response is an object keyed by channel id,
+// so one round trip covers the whole batch. Called from the prefetch workers
+// as well as the calling thread, and touches no shared state of its own.
+bool CPVREon::FetchEpgEntries(const std::vector<int>& channelUids,
+                              time_t start,
+                              time_t end,
+                              std::map<int, std::vector<EonEpgEntry>>& entries)
+{
+  if (channelUids.empty())
+    return true;
+
+  std::string cids;
+  for (const int channelUid : channelUids)
+  {
+    if (!cids.empty())
+      cids += ",";
+    cids += std::to_string(channelUid);
+  }
+
+  const std::string url = m_api + "v1/events/epg" +
+                                  "?cid=" + cids +
+                                  "&fromTime=" + std::to_string(start) + "000" +
+                                  "&toTime=" + std::to_string(end) + "000";
+
+  // Kodi calls this in the background to populate the EPG grid, often for
+  // many channels back-to-back (e.g. at startup) -- a modal error dialog
+  // per failed batch would be extremely disruptive. One batch's EPG
+  // failing isn't fatal: the caller retries those channels one by one, and
+  // if that fails too Kodi just shows no EPG data for them and moves on.
+  rapidjson::Document epgDoc;
+  if (!GetPostJson(url, "", epgDoc, false)) {
+    kodi::Log(ADDON_LOG_ERROR, "[GetEPG] ERROR: error while parsing json");
+    return false;
+  }
+
+  for (const int channelUid : channelUids)
+  {
+    const std::string cid = std::to_string(channelUid);
+    std::vector<EonEpgEntry>& channelEntries = entries[channelUid];
+
+    // A channel with no programmes in the window is simply absent from the
+    // response -- not an error, just nothing to add.
+    if (!epgDoc.HasMember(cid.c_str()) || !epgDoc[cid.c_str()].IsArray())
+      continue;
+
+    const rapidjson::Value& epgitems = epgDoc[cid.c_str()];
+    channelEntries.reserve(epgitems.Size());
+    for (rapidjson::Value::ConstValueIterator itr1 = epgitems.Begin();
+        itr1 != epgitems.End(); ++itr1)
+    {
+      channelEntries.emplace_back(ParseEpgEntry(*itr1));
+    }
+  }
+
+  return true;
+}
+
+// Starts (or restarts) the background prefetch for the window Kodi is
+// currently walking. Cheap to call on every GetEPGForChannel(): it returns
+// immediately once a prefetch for that same window is already running.
+void CPVREon::StartEpgPrefetch(int firstChannelUid, time_t start, time_t end)
+{
+  if (end - start < EPG_PREFETCH_MIN_WINDOW || m_channels.size() <= EPG_CHANNELS_PER_REQUEST)
+    return;
+
+  std::lock_guard<std::mutex> lifecycle(m_epgPrefetchLifecycle);
+
+  {
+    std::lock_guard<std::mutex> lock(m_epgPrefetch.mutex);
+    if (m_epgPrefetch.running && m_epgPrefetch.start == start && m_epgPrefetch.end == end)
+      return;
+
+    // Wait until enough different channels have asked for this same window to
+    // make it clear Kodi is walking the whole guide rather than refreshing a
+    // single channel. The handful of channels that get us to the threshold
+    // fetch themselves, which costs a fraction of a second.
+    if (m_epgPrefetch.observedStart != start || m_epgPrefetch.observedEnd != end)
+    {
+      m_epgPrefetch.observed.clear();
+      m_epgPrefetch.observedStart = start;
+      m_epgPrefetch.observedEnd = end;
+    }
+    m_epgPrefetch.observed.insert(firstChannelUid);
+    if (m_epgPrefetch.observed.size() < EPG_PREFETCH_TRIGGER_CHANNELS)
+      return;
+  }
+
+  // A different window means a new update pass, which makes whatever the
+  // previous one had prefetched useless.
+  StopEpgPrefetch();
+
+  std::vector<int> channelUids;
+  channelUids.reserve(m_channels.size());
+  for (const auto& channel : m_channels)
+    channelUids.emplace_back(channel.iUniqueId);
+
+  std::deque<std::vector<int>> queue;
+  for (size_t i = 0; i < channelUids.size(); i += EPG_CHANNELS_PER_REQUEST)
+  {
+    queue.emplace_back(channelUids.begin() + i,
+                       channelUids.begin() +
+                           std::min(i + EPG_CHANNELS_PER_REQUEST, channelUids.size()));
+  }
+
+  // Kodi is blocked on firstChannelUid right now, so start with its batch.
+  for (size_t i = 0; i < queue.size(); ++i)
+  {
+    if (std::find(queue[i].begin(), queue[i].end(), firstChannelUid) != queue[i].end())
+    {
+      std::rotate(queue.begin(), queue.begin() + i, queue.end());
+      break;
+    }
+  }
+
+  const size_t batches = queue.size();
+  {
+    std::lock_guard<std::mutex> lock(m_epgPrefetch.mutex);
+    m_epgPrefetch.queue = std::move(queue);
+    m_epgPrefetch.pending.clear();
+    m_epgPrefetch.pending.insert(channelUids.begin(), channelUids.end());
+    m_epgPrefetch.ready.clear();
+    m_epgPrefetch.failed.clear();
+    m_epgPrefetch.start = start;
+    m_epgPrefetch.end = end;
+    // Note: waiters is owned by the waiting callers, whose increment and
+    // decrement have to pair -- resetting it here would underflow it.
+    ++m_epgPrefetch.generation;
+    m_epgPrefetch.stop = false;
+    m_epgPrefetch.running = true;
+
+    const size_t workers = std::min(EPG_PREFETCH_THREADS, batches);
+    for (size_t i = 0; i < workers; ++i)
+      m_epgPrefetch.workers.emplace_back([this] { EpgPrefetchWorker(); });
+  }
+
+  kodi::Log(ADDON_LOG_INFO,
+            "EPG prefetch started. channels=%zu batches=%zu threads=%zu start=%lld end=%lld",
+            channelUids.size(), batches, std::min(EPG_PREFETCH_THREADS, batches),
+            static_cast<long long>(start), static_cast<long long>(end));
+}
+
+void CPVREon::StopEpgPrefetch()
+{
+  std::vector<std::thread> workers;
+  {
+    std::lock_guard<std::mutex> lock(m_epgPrefetch.mutex);
+    if (!m_epgPrefetch.running && m_epgPrefetch.workers.empty())
+      return;
+
+    m_epgPrefetch.stop = true;
+    m_epgPrefetch.running = false;
+    m_epgPrefetch.queue.clear();
+    m_epgPrefetch.pending.clear();
+    workers = std::move(m_epgPrefetch.workers);
+    m_epgPrefetch.workers.clear();
+  }
+
+  // Wakes both the workers and anyone waiting on a channel that will now
+  // never arrive; a worker already inside a request finishes it first.
+  m_epgPrefetch.cv.notify_all();
+  for (auto& worker : workers)
+  {
+    if (worker.joinable())
+      worker.join();
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(m_epgPrefetch.mutex);
+    m_epgPrefetch.ready.clear();
+    m_epgPrefetch.failed.clear();
+    m_epgPrefetch.stop = false;
+  }
+}
+
+void CPVREon::EpgPrefetchWorker()
+{
+  for (;;)
+  {
+    std::vector<int> batch;
+    time_t start = 0;
+    time_t end = 0;
+    uint64_t generation = 0;
+
+    {
+      std::unique_lock<std::mutex> lock(m_epgPrefetch.mutex);
+
+      // Hold off once enough channels are sitting uncollected -- unless
+      // someone is actually waiting, in which case running ahead is the whole
+      // point and the cap would deadlock us against the blocked caller.
+      m_epgPrefetch.cv.wait(lock, [this] {
+        return m_epgPrefetch.stop || m_epgPrefetch.queue.empty() ||
+               m_epgPrefetch.ready.size() < EPG_PREFETCH_MAX_READY ||
+               m_epgPrefetch.waiters > 0;
+      });
+
+      if (m_epgPrefetch.stop || m_epgPrefetch.queue.empty())
+        return;
+
+      batch = std::move(m_epgPrefetch.queue.front());
+      m_epgPrefetch.queue.pop_front();
+      start = m_epgPrefetch.start;
+      end = m_epgPrefetch.end;
+      generation = m_epgPrefetch.generation;
+    }
+
+    std::map<int, std::vector<EonEpgEntry>> fetched;
+    const bool fetched_ok = FetchEpgEntries(batch, start, end, fetched);
+
+    {
+      std::lock_guard<std::mutex> lock(m_epgPrefetch.mutex);
+      if (m_epgPrefetch.stop || m_epgPrefetch.generation != generation)
+        return;
+
+      for (const int channelUid : batch)
+      {
+        if (fetched_ok)
+          m_epgPrefetch.ready[channelUid] = std::move(fetched[channelUid]);
+        else
+          m_epgPrefetch.failed.insert(channelUid);
+        m_epgPrefetch.pending.erase(channelUid);
+      }
+    }
+    m_epgPrefetch.cv.notify_all();
+  }
+}
+
+// Hands over this channel's prefetched programmes, waiting for them if the
+// workers haven't got there yet. False means the caller has to fetch the
+// channel itself: no prefetch for this window, the batch failed, or it timed
+// out.
+bool CPVREon::TakePrefetchedEpg(int channelUid,
+                                time_t start,
+                                time_t end,
+                                std::vector<EonEpgEntry>& entries)
+{
+  std::unique_lock<std::mutex> lock(m_epgPrefetch.mutex);
+
+  if (!m_epgPrefetch.running || m_epgPrefetch.start != start || m_epgPrefetch.end != end)
+    return false;
+
+  if (m_epgPrefetch.ready.count(channelUid) == 0 &&
+      m_epgPrefetch.pending.count(channelUid) == 0)
+    return false;
+
+  const uint64_t generation = m_epgPrefetch.generation;
+
+  // Kodi collects the channels in its own order, so the batch holding this one
+  // may still be sitting in the queue. Move it to the front instead of waiting
+  // for the workers to arrive at it in their own time.
+  for (size_t i = 0; i < m_epgPrefetch.queue.size(); ++i)
+  {
+    if (std::find(m_epgPrefetch.queue[i].begin(), m_epgPrefetch.queue[i].end(), channelUid) !=
+        m_epgPrefetch.queue[i].end())
+    {
+      std::rotate(m_epgPrefetch.queue.begin(), m_epgPrefetch.queue.begin() + i,
+                  m_epgPrefetch.queue.end());
+      break;
+    }
+  }
+
+  ++m_epgPrefetch.waiters;
+  m_epgPrefetch.cv.notify_all();
+  const bool arrived = m_epgPrefetch.cv.wait_for(
+      lock, std::chrono::seconds(EPG_PREFETCH_TIMEOUT_SECONDS), [this, channelUid, generation] {
+        return m_epgPrefetch.stop || m_epgPrefetch.generation != generation ||
+               m_epgPrefetch.ready.count(channelUid) > 0 ||
+               m_epgPrefetch.failed.count(channelUid) > 0;
+      });
+  --m_epgPrefetch.waiters;
+
+  const auto it = m_epgPrefetch.ready.find(channelUid);
+  if (!arrived || m_epgPrefetch.stop || m_epgPrefetch.generation != generation ||
+      it == m_epgPrefetch.ready.end())
+  {
+    if (!arrived)
+      kodi::Log(ADDON_LOG_ERROR, "EPG prefetch timed out for channel %i, fetching it directly.",
+                channelUid);
+    lock.unlock();
+    m_epgPrefetch.cv.notify_all();
+    return false;
+  }
+
+  entries = std::move(it->second);
+  m_epgPrefetch.ready.erase(it);
+
+  // Collecting one frees a slot under EPG_PREFETCH_MAX_READY.
+  lock.unlock();
+  m_epgPrefetch.cv.notify_all();
+  return true;
+}
+
 PVR_ERROR CPVREon::GetEPGForChannel(int channelUid,
                                      time_t start,
                                      time_t end,
                                      kodi::addon::PVREPGTagsResultSet& results)
 {
   kodi::Log(ADDON_LOG_DEBUG, "function call: [%s]", __FUNCTION__);
-  for (const auto& channel : m_channels)
+
+  const bool known_channel =
+      std::any_of(m_channels.begin(), m_channels.end(),
+                  [channelUid](const EonChannel& channel) {
+                    return channel.iUniqueId == channelUid;
+                  });
+  if (!known_channel)
+    return PVR_ERROR_NO_ERROR;
+
+  kodi::Log(ADDON_LOG_DEBUG, "EPG Request for Channel %u Start %u End %u", channelUid, start, end);
+
+  StartEpgPrefetch(channelUid, start, end);
+
+  std::vector<EonEpgEntry> entries;
+  if (!TakePrefetchedEpg(channelUid, start, end, entries))
   {
-
-    if (channel.iUniqueId != channelUid)
-      continue;
-
-    kodi::Log(ADDON_LOG_DEBUG, "EPG Request for Channel %u Start %u End %u", channel.iUniqueId, start, end);
-
-    std::string url = m_api + "v1/events/epg" +
-                              "?cid=" + std::to_string(channel.iUniqueId) +
-                              "&fromTime=" + std::to_string(start) + "000" +
-                              "&toTime=" + std::to_string(end) + "000";
-
-    // Kodi calls this in the background to populate the EPG grid, often for
-    // many channels back-to-back (e.g. at startup) -- a modal error dialog
-    // per failed channel would be extremely disruptive. One channel's EPG
-    // failing isn't fatal: Kodi just shows no EPG data for it and moves on.
-    rapidjson::Document epgDoc;
-    if (!GetPostJson(url, "", epgDoc, false)) {
-      kodi::Log(ADDON_LOG_ERROR, "[GetEPG] ERROR: error while parsing json");
+    std::map<int, std::vector<EonEpgEntry>> fetched;
+    if (!FetchEpgEntries({channelUid}, start, end, fetched))
       return PVR_ERROR_SERVER_ERROR;
-    }
 
-    kodi::Log(ADDON_LOG_DEBUG, "[epg] iterate entries");
+    entries = std::move(fetched[channelUid]);
+  }
 
-//    std::string cid = "\"" + std::to_string(channel.referenceID) + "\"";
-    std::string cid = std::to_string(channel.iUniqueId);
-//    kodi::Log(ADDON_LOG_DEBUG, "EPG Channel ReferenceID: %s", cid.c_str());
-    const rapidjson::Value& epgitems = epgDoc[cid.c_str()];
-//    kodi::Log(ADDON_LOG_DEBUG, "EPG Items: %s", epgitems.c_str());
-    for (rapidjson::Value::ConstValueIterator itr1 = epgitems.Begin();
-        itr1 != epgitems.End(); ++itr1)
-    {
-      const rapidjson::Value& epgItem = (*itr1);
+  kodi::Log(ADDON_LOG_DEBUG, "[epg] iterate entries");
 
-      kodi::addon::PVREPGTag tag;
-      unsigned int epg_tag_flags = EPG_TAG_FLAG_UNDEFINED;
+  for (const auto& entry : entries)
+  {
+    kodi::addon::PVREPGTag tag;
 
-      tag.SetUniqueBroadcastId(Utils::JsonIntOrZero(epgItem,"id"));
-      tag.SetUniqueChannelId(channelUid);
-      tag.SetTitle(Utils::JsonStringOrEmpty(epgItem,"title"));
-      tag.SetOriginalTitle(Utils::JsonStringOrEmpty(epgItem,"originalTitle"));
-      time_t starttime = (time_t) (Utils::JsonInt64OrZero(epgItem,"startTime") / 1000);
-      time_t endtime = (time_t) (Utils::JsonInt64OrZero(epgItem,"endTime") / 1000);
-      tag.SetStartTime(starttime);
-      tag.SetEndTime(endtime);
-      tag.SetPlot(Utils::JsonStringOrEmpty(epgItem,"shortDescription"));
-      int seasonNumber = Utils::JsonIntOrZero(epgItem,"seasonNumber");
-      if (seasonNumber != 0)
-        tag.SetSeriesNumber(seasonNumber);
-      int episodeNumber = Utils::JsonIntOrZero(epgItem,"episodeNumber");
-      if (episodeNumber != 0)
-      {
-        tag.SetEpisodeNumber(episodeNumber);
-        epg_tag_flags += EPG_TAG_FLAG_IS_SERIES;
-      }
-      int ageRating = 0;
-      try {
-        ageRating = std::stoi(Utils::JsonStringOrEmpty(epgItem,"ageRating"));
-      } catch (std::invalid_argument&e) {
-
-      }
-      if (ageRating != 0)
-        tag.SetParentalRating(ageRating);
-
-      if (Utils::JsonBoolOrFalse(epgItem, "liveBroadcast"))
-        epg_tag_flags += EPG_TAG_FLAG_IS_LIVE;
-
-      const rapidjson::Value& images = epgItem["images"];
-      for (rapidjson::Value::ConstValueIterator itr2 = images.Begin();
-          itr2 != images.End(); ++itr2)
-      {
-        const rapidjson::Value& imageItem = (*itr2);
-
-        if (Utils::JsonStringOrEmpty(imageItem, "size") == "STB_XL") {
-          tag.SetIconPath(m_images_api + Utils::JsonStringOrEmpty(imageItem, "path"));
-        }
-      }
-/*
-      const rapidjson::Value& categories = epgItem["categories"];
-      for (rapidjson::SizeType i = 0; i < categories.Size(); i++)
-      {
-        kodi::Log(ADDON_LOG_DEBUG, "Category: %u", categories[i].GetInt());
-      }
-*/
-//      kodi::Log(ADDON_LOG_DEBUG, "%u adding EPG: ID: %u Title: %s Start: %u End: %u", channelUid, Utils::JsonIntOrZero(epgItem,"id"), Utils::JsonStringOrEmpty(epgItem,"title").c_str(),Utils::JsonIntOrZero(epgItem,"startTime")/1000,Utils::JsonIntOrZero(epgItem,"endTime")/1000);
-      tag.SetFlags(epg_tag_flags);
-      results.Add(tag);
-    }
+    tag.SetUniqueBroadcastId(entry.broadcastId);
+    tag.SetUniqueChannelId(channelUid);
+    tag.SetTitle(entry.title);
+    tag.SetOriginalTitle(entry.originalTitle);
+    tag.SetStartTime(entry.startTime);
+    tag.SetEndTime(entry.endTime);
+    tag.SetPlot(entry.plot);
+    if (entry.seriesNumber != 0)
+      tag.SetSeriesNumber(entry.seriesNumber);
+    if (entry.episodeNumber != 0)
+      tag.SetEpisodeNumber(entry.episodeNumber);
+    if (entry.parentalRating != 0)
+      tag.SetParentalRating(entry.parentalRating);
+    if (!entry.iconPath.empty())
+      tag.SetIconPath(entry.iconPath);
+    tag.SetFlags(entry.flags);
+    results.Add(tag);
   }
 
   return PVR_ERROR_NO_ERROR;

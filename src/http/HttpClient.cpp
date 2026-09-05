@@ -333,6 +333,7 @@ void HttpClient::ClearSession() {
 
 std::string HttpClient::GetUUID()
 {
+  std::lock_guard<std::mutex> lock(m_authMutex);
   if (!m_uuid.empty())
   {
     return m_uuid;
@@ -397,6 +398,56 @@ std::string HttpClient::HttpPost(const std::string& url, const std::string& post
   return HttpRequest("POST", url, postData, statusCode);
 }
 
+std::string HttpClient::ApplyAuthHeadersLocked(Curl& curl, const std::string& url,
+                                              std::string& authMode)
+{
+  std::string access_token;
+  authMode.clear();
+
+  size_t found = url.find(m_supportApi);
+  if (found != std::string::npos) {
+    access_token = m_settings->GetSSAccessToken();
+    if (!access_token.empty()) {
+      curl.AddHeader("accesstoken", access_token);
+      authMode = "ss-access-token";
+    }
+    std::string basic_token = SS_USER + ":" + SS_SECRET;
+    curl.AddHeader("Authorization", "Basic " + base64_encode(basic_token.c_str(), basic_token.length()));
+    if (authMode.empty())
+      authMode = "ss-basic";
+    return access_token;
+  }
+
+  if (url.find(BROKER_URL) != std::string::npos || url.find("v1/devices") != std::string::npos) {
+    access_token = m_settings->GetGenericAccessToken();
+    authMode = access_token.empty() ? "generic-basic" : "generic-bearer";
+  } else {
+    access_token = m_settings->GetEonAccessToken();
+    authMode = access_token.empty() ? "main-basic" : "main-bearer";
+  }
+
+  if (!access_token.empty()) {
+    curl.AddHeader("Authorization", "bearer " + access_token);
+  } else {
+    std::string basic_token = EonParameters[m_platform].client_id + ":" + EonParameters[m_platform].client_secret;
+    curl.AddHeader("Authorization", "Basic " + base64_encode(basic_token.c_str(), basic_token.length()));
+  }
+
+  return access_token;
+}
+
+bool HttpClient::RefreshTokenForUrlLocked(const std::string& url)
+{
+  size_t found = url.find(m_supportApi);
+  if (found != std::string::npos)
+    return RefreshSSToken();
+
+  if (url.find(BROKER_URL) != std::string::npos || url.find("v1/devices") != std::string::npos)
+    return RefreshGenericToken();
+
+  return RefreshToken();
+}
+
 std::string HttpClient::HttpRequest(const std::string& action, const std::string& url, const std::string& postData, int &statusCode)
 {
   Curl curl;
@@ -404,32 +455,9 @@ std::string HttpClient::HttpRequest(const std::string& action, const std::string
   std::string auth_mode;
 
   AddRequestHeaders(curl, url);
-
-  size_t found = url.find(m_supportApi);
-  if (found != std::string::npos) {
-    access_token = m_settings->GetSSAccessToken();
-    if (!access_token.empty()) {
-      curl.AddHeader("accesstoken", access_token);
-      auth_mode = "ss-access-token";
-    }
-    std::string basic_token = SS_USER + ":" + SS_SECRET;
-    curl.AddHeader("Authorization", "Basic " + base64_encode(basic_token.c_str(), basic_token.length()));
-    if (auth_mode.empty())
-      auth_mode = "ss-basic";
-  } else {
-    if (url.find(BROKER_URL) != std::string::npos || url.find("v1/devices") != std::string::npos) {
-      access_token = m_settings->GetGenericAccessToken();
-      auth_mode = access_token.empty() ? "generic-basic" : "generic-bearer";
-    } else {
-      access_token = m_settings->GetEonAccessToken();
-      auth_mode = access_token.empty() ? "main-basic" : "main-bearer";
-    }
-    if (!access_token.empty()) {
-      curl.AddHeader("Authorization", "bearer " + access_token);
-    } else {
-      std::string basic_token = EonParameters[m_platform].client_id + ":" + EonParameters[m_platform].client_secret;
-      curl.AddHeader("Authorization", "Basic " + base64_encode(basic_token.c_str(), basic_token.length()));
-    }
+  {
+    std::lock_guard<std::mutex> lock(m_authMutex);
+    access_token = ApplyAuthHeadersLocked(curl, url, auth_mode);
   }
 
   std::string content = HttpRequestToCurl(curl, action, url, postData, statusCode);
@@ -438,34 +466,28 @@ std::string HttpClient::HttpRequest(const std::string& action, const std::string
     kodi::Log(ADDON_LOG_INFO,
               "HTTP 401 for %s %s. auth=%s payloadLen=%zu, attempting token refresh.",
               action.c_str(), url.c_str(), auth_mode.c_str(), postData.size());
+
+    std::lock_guard<std::mutex> lock(m_authMutex);
+
     Curl curl_reauth;
     AddRequestHeaders(curl_reauth, url);
-    size_t found = url.find(m_supportApi);
-    bool refresh_successful = true;
     std::string retry_auth_mode;
-    if (found != std::string::npos) {
-      if (RefreshSSToken()) {
-        access_token = m_settings->GetSSAccessToken();
-        curl_reauth.AddHeader("accesstoken", access_token);
-        std::string basic_token = SS_USER + ":" + SS_SECRET;
-        curl_reauth.AddHeader("Authorization", "Basic " + base64_encode(basic_token.c_str(), basic_token.length()));
-        retry_auth_mode = "ss-access-token";
-      } else {
-        refresh_successful = false;
-      }
+    std::string current_token = ApplyAuthHeadersLocked(curl_reauth, url, retry_auth_mode);
+
+    // With several requests in flight, another thread may already have
+    // refreshed the token this one was signed with while we waited for the
+    // lock. Retrying with the current token first keeps a burst of 401s from
+    // turning into a burst of refreshes that invalidate each other.
+    bool refresh_successful = true;
+    if (current_token.empty() || current_token == access_token) {
+      refresh_successful = RefreshTokenForUrlLocked(url);
+      if (refresh_successful)
+        current_token = ApplyAuthHeadersLocked(curl_reauth, url, retry_auth_mode);
     } else {
-      if (url.find(BROKER_URL) != std::string::npos || url.find("v1/devices") != std::string::npos) {
-        refresh_successful = RefreshGenericToken();
-        access_token = m_settings->GetGenericAccessToken();
-        retry_auth_mode = "generic-bearer";
-      } else {
-        refresh_successful = RefreshToken();
-        access_token = m_settings->GetEonAccessToken();
-        retry_auth_mode = "main-bearer";
-      }
-      if (refresh_successful && !access_token.empty())
-        curl_reauth.AddHeader("Authorization", "bearer " + access_token);
+      kodi::Log(ADDON_LOG_INFO,
+                "Token was already refreshed by another request, retrying without refreshing again.");
     }
+
     if (refresh_successful) {
       content = HttpRequestToCurl(curl_reauth, action, url, postData, statusCode);
       kodi::Log(ADDON_LOG_INFO, "HTTP retry after refresh completed. auth=%s status=%i responseLen=%zu",
@@ -476,9 +498,7 @@ std::string HttpClient::HttpRequest(const std::string& action, const std::string
         // Try to get new token as last resort
         m_settings->SetSetting("refreshtoken", "");
         refresh_successful = RefreshToken();
-        access_token = m_settings->GetEonAccessToken();
-        if (!access_token.empty())
-          curl_reauth.AddHeader("Authorization", "bearer " + access_token);
+        ApplyAuthHeadersLocked(curl_reauth, url, retry_auth_mode);
         if (refresh_successful) {
           content = HttpRequestToCurl(curl_reauth, action, url, postData, statusCode);
           kodi::Log(ADDON_LOG_INFO, "HTTP retry after last-resort refresh completed. status=%i responseLen=%zu",

@@ -6,11 +6,15 @@
  *  See LICENSE.md for more information.
  */
 
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
 #include <map>
+#include <mutex>
+#include <set>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <kodi/addon-instance/PVR.h>
@@ -24,6 +28,52 @@ static const int INPUTSTREAM_FFMPEGDIRECT = 1;
 
 static const int PLATFORM_WEB = 0;
 static const int PLATFORM_ANDROIDTV = 1;
+
+// The backend answers a guide request for several channels at once -- the
+// per-channel arrays come back keyed by channel id -- but rejects more ids
+// than this in one request with HTTP 400 invalid_input.
+static const size_t EPG_CHANNELS_PER_REQUEST = 15;
+// Worker threads filling the prefetch. Measured against the live backend over
+// a 10 day window for 289 channels: ~37s one channel per request (what Kodi
+// asks for on its own), ~22s batched, ~5s batched across four threads, and
+// eight threads buy nothing on top of that -- the backend is the limit by then.
+static const size_t EPG_PREFETCH_THREADS = 4;
+// How many channels may sit fetched-but-not-yet-collected before the workers
+// pause. Bounds what the prefetch costs in memory, since Kodi collects the
+// channels in its own order rather than the one we fetch them in.
+static const size_t EPG_PREFETCH_MAX_READY = 60;
+// Only prefetch when Kodi is populating a whole guide window. Short lookups
+// (the single programme around a given time) stay plain one-off requests.
+static const time_t EPG_PREFETCH_MIN_WINDOW = 12 * 60 * 60;
+// Distinct channels that have to ask for the same window before the prefetch
+// starts. Kodi also refreshes single channels on their own (a channel that
+// came back empty, a manual update request); fanning one of those out into a
+// fetch of the entire guide would cost far more than it saves, and a run of
+// one-off requests never reaches this many channels.
+static const size_t EPG_PREFETCH_TRIGGER_CHANNELS = 3;
+// Safety net for a batch that never lands (dead network): the caller falls
+// back to fetching its own channel, which then reports the error as before.
+static const int EPG_PREFETCH_TIMEOUT_SECONDS = 60;
+
+// One programme, holding just the fields the add-on passes on to Kodi.
+// Deliberately not a kodi::addon::PVREPGTag: copying one of those copies the
+// C struct's char pointers but not their targets, so a PVREPGTag stored in a
+// container would be left pointing at freed strings the moment the container
+// reallocates.
+struct EonEpgEntry
+{
+  int broadcastId = 0;
+  time_t startTime = 0;
+  time_t endTime = 0;
+  int seriesNumber = 0;
+  int episodeNumber = 0;
+  int parentalRating = 0;
+  unsigned int flags = EPG_TAG_FLAG_UNDEFINED;
+  std::string title;
+  std::string originalTitle;
+  std::string plot;
+  std::string iconPath;
+};
 
 struct EonChannelCategory
 {
@@ -315,6 +365,42 @@ private:
   };
   std::map<int, EonAiringProgramme> m_airing_programmes;
 
+  // Kodi asks for the guide one channel at a time and waits for each answer,
+  // so populating every channel is one blocking round trip per channel. The
+  // first call of an update pass instead starts a background prefetch that
+  // pulls the whole guide in batched, parallel requests; every call is then
+  // served out of `ready` -- see GetEPGForChannel().
+  struct EonEpgPrefetch
+  {
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::vector<std::thread> workers;
+    std::deque<std::vector<int>> queue; // channel uids, batched, not fetched yet
+    std::set<int> pending; // uids this prefetch still owes an answer for
+    std::map<int, std::vector<EonEpgEntry>> ready; // fetched, by channel uid
+    std::set<int> failed; // batch failed; the caller retries that channel alone
+    time_t start = 0;
+    time_t end = 0;
+    // Channels seen asking for `observedStart`..`observedEnd` so far, which is
+    // what tells a full update pass apart from a one-off single-channel
+    // refresh -- see EPG_PREFETCH_TRIGGER_CHANNELS.
+    std::set<int> observed;
+    time_t observedStart = 0;
+    time_t observedEnd = 0;
+    size_t waiters = 0;
+    // Bumped every time a prefetch is (re)started. A caller can be waiting on
+    // a channel while a new update pass replaces the prefetch underneath it;
+    // comparing generations is how it notices, rather than being handed
+    // programmes fetched for a window it never asked about.
+    uint64_t generation = 0;
+    bool running = false;
+    bool stop = false;
+  };
+  EonEpgPrefetch m_epgPrefetch;
+  // Serialises starting and stopping the prefetch as a whole, so two update
+  // passes arriving together cannot both tear down and rebuild it.
+  std::mutex m_epgPrefetchLifecycle;
+
   std::string m_service_provider;
   std::string m_support_web;
 //  std::string m_ss_access;
@@ -335,6 +421,18 @@ private:
 
   std::string GetTime();
   int getBitrate(const bool isRadio, const int id);
+  EonEpgEntry ParseEpgEntry(const rapidjson::Value& epgItem) const;
+  bool FetchEpgEntries(const std::vector<int>& channelUids,
+                       time_t start,
+                       time_t end,
+                       std::map<int, std::vector<EonEpgEntry>>& entries);
+  void StartEpgPrefetch(int firstChannelUid, time_t start, time_t end);
+  void StopEpgPrefetch();
+  void EpgPrefetchWorker();
+  bool TakePrefetchedEpg(int channelUid,
+                         time_t start,
+                         time_t end,
+                         std::vector<EonEpgEntry>& entries);
   bool GetPostJson(const std::string& url, const std::string& body, rapidjson::Document& doc,
                     bool showErrorDialog = true);
   std::string getCoreStreamId(const int id);
