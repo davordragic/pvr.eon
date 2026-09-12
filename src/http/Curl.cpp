@@ -1,5 +1,6 @@
 #include "Curl.h"
 #include <kodi/Filesystem.h>
+#include <cstdint>
 #include <utility>
 #include "../Utils.h"
 
@@ -111,13 +112,22 @@ std::string Curl::Request(const std::string& action, const std::string& url, con
 
   // read the file
   static const unsigned int CHUNKSIZE = 16384;
-  char buf[CHUNKSIZE + 1];
+  char buf[CHUNKSIZE];
   ssize_t nbRead;
   std::string body;
-  while ((nbRead = file.Read(buf, CHUNKSIZE)) > 0 && ~nbRead)
+
+  // A guide response runs to hundreds of kilobytes, so grow the buffer once
+  // up front rather than reallocating and copying it every time it doubles.
+  const int64_t length = file.GetLength();
+  if (length > 0)
+    body.reserve(static_cast<size_t>(length));
+
+  // Append by length, not as a C string: the response is bytes, and treating
+  // it as NUL-terminated would both cost a strlen() per chunk and truncate a
+  // body that happens to contain a NUL.
+  while ((nbRead = file.Read(buf, CHUNKSIZE)) > 0)
   {
-    buf[nbRead] = 0x0;
-    body += buf;
+    body.append(buf, static_cast<size_t>(nbRead));
   }
 
   return body;

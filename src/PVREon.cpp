@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <thread>
 
 #include <kodi/Filesystem.h>
@@ -96,9 +97,30 @@ const char* InputstreamName(int inputstream)
   }
 }
 
+// Where the add-on records that it has handed Kodi the whole guide window.
+constexpr char EPG_DELIVERY_STATE_FILE[] = "epgdelivery.txt";
+constexpr int EPG_DELIVERY_STATE_VERSION = 1;
+
 std::string DescribeValue(const std::string& value)
 {
   return value.empty() ? "empty" : "set(len=" + std::to_string(value.size()) + ")";
+}
+
+// The guide carries the age rating as a string, and most programmes leave it
+// empty or non-numeric. std::stoi signals that by throwing, which costs far
+// more than the parse itself when it happens tens of thousands of times in one
+// guide refresh -- so read it without exceptions.
+int AgeRatingOrZero(const std::string& value)
+{
+  if (value.empty())
+    return 0;
+
+  char* end = nullptr;
+  const long rating = std::strtol(value.c_str(), &end, 10);
+  if (end == value.c_str() || rating <= 0 || rating > std::numeric_limits<int>::max())
+    return 0;
+
+  return static_cast<int>(rating);
 }
 
 std::string PreviewForLog(std::string value)
@@ -927,6 +949,8 @@ CPVREon::CPVREon() :
                                            [](const EonChannel& channel) { return !channel.bRadio; });
   const size_t radio_channels = std::count_if(m_channels.begin(), m_channels.end(),
                                               [](const EonChannel& channel) { return channel.bRadio; });
+  LoadEpgDeliveryState();
+
   kodi::Log(ADDON_LOG_INFO,
             "Startup finished. allgood=%s totalChannels=%zu tvChannels=%zu radioChannels=%zu categories=%zu",
             BoolState(allgood), m_channels.size(), tv_channels, radio_channels, m_categories.size());
@@ -1911,6 +1935,117 @@ PVR_ERROR CPVREon::GetDriveSpace(uint64_t& total, uint64_t& used)
   return PVR_ERROR_NO_ERROR;
 }
 
+// Remembers across restarts that Kodi has already been given the full guide,
+// which is what lets a refresh skip the week of programmes that have already
+// aired. Kept in the add-on's own profile directory: it is state about what
+// this add-on has sent, not something a user would ever set.
+void CPVREon::LoadEpgDeliveryState()
+{
+  const std::string path = Utils::GetFilePath(EPG_DELIVERY_STATE_FILE);
+  if (!kodi::vfs::FileExists(path, false))
+    return;
+
+  const std::string content = Utils::ReadFile(path);
+  long long deliveredAt = 0;
+  unsigned long long channels = 0;
+  long long past = 0;
+  int version = 0;
+  if (std::sscanf(content.c_str(), "%d %lld %llu %lld", &version, &deliveredAt, &channels, &past) != 4 ||
+      version != EPG_DELIVERY_STATE_VERSION || deliveredAt <= 0 || past < 0)
+  {
+    kodi::Log(ADDON_LOG_INFO, "Ignoring unreadable EPG delivery state, next refresh fetches the full guide.");
+    return;
+  }
+
+  m_epgFullPassAt = static_cast<time_t>(deliveredAt);
+  m_epgFullPassChannels = static_cast<size_t>(channels);
+  m_epgFullPassPast = static_cast<time_t>(past);
+  kodi::Log(ADDON_LOG_INFO, "Loaded EPG delivery state. fullPassAt=%lld channels=%zu pastSeconds=%lld",
+            static_cast<long long>(m_epgFullPassAt), m_epgFullPassChannels,
+            static_cast<long long>(m_epgFullPassPast));
+}
+
+void CPVREon::SaveEpgDeliveryState()
+{
+  const std::string dir = Utils::GetFilePath("");
+  if (!dir.empty() && !kodi::vfs::DirectoryExists(dir) && !kodi::vfs::CreateDirectory(dir))
+  {
+    kodi::Log(ADDON_LOG_ERROR, "Could not create %s to store the EPG delivery state.", dir.c_str());
+    return;
+  }
+
+  const std::string path = Utils::GetFilePath(EPG_DELIVERY_STATE_FILE);
+  kodi::vfs::CFile file;
+  if (!file.OpenFileForWrite(path, true))
+  {
+    kodi::Log(ADDON_LOG_ERROR, "Could not write the EPG delivery state to %s.", path.c_str());
+    return;
+  }
+
+  const std::string content = std::to_string(EPG_DELIVERY_STATE_VERSION) + " " +
+                              std::to_string(static_cast<long long>(m_epgFullPassAt)) + " " +
+                              std::to_string(m_epgFullPassChannels) + " " +
+                              std::to_string(static_cast<long long>(m_epgFullPassPast));
+  file.Write(content.c_str(), content.size());
+}
+
+// Resolves the window a refresh actually fetches and delivers. Kodi asks for
+// everything from `pastdaystodisplay` ago, every time, for every channel; once
+// it has been given that history there is no reason to send it again, so a
+// refresh that follows a full one only carries the recent past and the future.
+// Resolved once per window rather than per channel, so that the whole pass --
+// the prefetch included -- agrees on what it is fetching.
+time_t CPVREon::EpgFetchStart(time_t start, time_t end)
+{
+  // Only a guide refresh may be shortened. Kodi also asks this for a single
+  // programme around a given time, and that window can sit entirely in the
+  // past -- moving its start to yesterday would ask the backend for a range
+  // that ends before it begins and answer with nothing. Such a lookup is
+  // answered before the window below is touched, so that one arriving in the
+  // middle of a refresh cannot displace the window that refresh is using and
+  // leave the rest of its channels re-resolving a start a few seconds later,
+  // which would miss the prefetch and fetch every one of them on its own.
+  if (end - start < EPG_PREFETCH_MIN_WINDOW)
+    return start;
+
+  std::lock_guard<std::mutex> lock(m_epgWindowMutex);
+
+  if (start == m_epgWindowStart && end == m_epgWindowEnd)
+    return m_epgFetchStart;
+
+  m_epgWindowStart = start;
+  m_epgWindowEnd = end;
+  m_epgFetchStart = start;
+
+  const time_t now = time(nullptr);
+  const time_t requestedPast = now > start ? now - start : 0;
+  const time_t trimmedStart = now - EPG_INCREMENTAL_PAST;
+
+  if (requestedPast <= EPG_INCREMENTAL_PAST || trimmedStart >= end)
+    return m_epgFetchStart; // Kodi is not asking for more history than we resend anyway.
+
+  if (m_epgFullPassAt == 0 || m_epgFullPassChannels != m_channels.size())
+    return m_epgFetchStart; // Kodi cannot have a history we never delivered.
+
+  // Kodi is displaying more history than the last full pass gave it -- someone
+  // raised `pastdaystodisplay` -- so the days it has never seen have to be
+  // delivered rather than assumed.
+  if (requestedPast > m_epgFullPassPast)
+    return m_epgFetchStart;
+
+  // Past this point Kodi would have aged out everything the last full pass
+  // gave it, so the history has to be delivered again rather than assumed.
+  if (now - m_epgFullPassAt > requestedPast)
+    return m_epgFetchStart;
+
+  m_epgFetchStart = trimmedStart;
+  kodi::Log(ADDON_LOG_INFO,
+            "Kodi already holds the guide history, fetching %lld days instead of %lld.",
+            static_cast<long long>((end - m_epgFetchStart) / (24 * 60 * 60)),
+            static_cast<long long>((end - start) / (24 * 60 * 60)));
+  return m_epgFetchStart;
+}
+
 EonEpgEntry CPVREon::ParseEpgEntry(const rapidjson::Value& epgItem) const
 {
   EonEpgEntry entry;
@@ -1926,11 +2061,7 @@ EonEpgEntry CPVREon::ParseEpgEntry(const rapidjson::Value& epgItem) const
   if (entry.episodeNumber != 0)
     entry.flags += EPG_TAG_FLAG_IS_SERIES;
 
-  try {
-    entry.parentalRating = std::stoi(Utils::JsonStringOrEmpty(epgItem, "ageRating"));
-  } catch (std::invalid_argument&e) {
-
-  }
+  entry.parentalRating = AgeRatingOrZero(Utils::JsonStringOrEmpty(epgItem, "ageRating"));
 
   if (Utils::JsonBoolOrFalse(epgItem, "liveBroadcast"))
     entry.flags += EPG_TAG_FLAG_IS_LIVE;
@@ -2009,7 +2140,7 @@ bool CPVREon::FetchEpgEntries(const std::vector<int>& channelUids,
 // Starts (or restarts) the background prefetch for the window Kodi is
 // currently walking. Cheap to call on every GetEPGForChannel(): it returns
 // immediately once a prefetch for that same window is already running.
-void CPVREon::StartEpgPrefetch(int firstChannelUid, time_t start, time_t end)
+void CPVREon::StartEpgPrefetch(int firstChannelUid, time_t start, time_t end, bool fullWindow)
 {
   if (end - start < EPG_PREFETCH_MIN_WINDOW || m_channels.size() <= EPG_CHANNELS_PER_REQUEST)
     return;
@@ -2040,27 +2171,30 @@ void CPVREon::StartEpgPrefetch(int firstChannelUid, time_t start, time_t end)
   // previous one had prefetched useless.
   StopEpgPrefetch();
 
+  // Kodi is blocked on firstChannelUid right now, so it leads the queue.
   std::vector<int> channelUids;
   channelUids.reserve(m_channels.size());
+  channelUids.emplace_back(firstChannelUid);
   for (const auto& channel : m_channels)
-    channelUids.emplace_back(channel.iUniqueId);
-
-  std::deque<std::vector<int>> queue;
-  for (size_t i = 0; i < channelUids.size(); i += EPG_CHANNELS_PER_REQUEST)
   {
-    queue.emplace_back(channelUids.begin() + i,
-                       channelUids.begin() +
-                           std::min(i + EPG_CHANNELS_PER_REQUEST, channelUids.size()));
+    if (channel.iUniqueId != firstChannelUid)
+      channelUids.emplace_back(channel.iUniqueId);
   }
 
-  // Kodi is blocked on firstChannelUid right now, so start with its batch.
-  for (size_t i = 0; i < queue.size(); ++i)
+  // Full-size batches are the most efficient way to pull the whole guide, but
+  // they are the slowest way to answer the first question: Kodi is waiting on
+  // one channel, and a batch of fifteen makes it wait for the other fourteen
+  // to be fetched as well. So ramp up -- the first requests are small enough
+  // to come back quickly, and by the time Kodi has worked through those the
+  // full-size batches behind them have landed.
+  std::deque<std::vector<int>> queue;
+  size_t batchSize = EPG_FIRST_BATCH_CHANNELS;
+  for (size_t i = 0; i < channelUids.size();)
   {
-    if (std::find(queue[i].begin(), queue[i].end(), firstChannelUid) != queue[i].end())
-    {
-      std::rotate(queue.begin(), queue.begin() + i, queue.end());
-      break;
-    }
+    const size_t size = std::min(batchSize, channelUids.size() - i);
+    queue.emplace_back(channelUids.begin() + i, channelUids.begin() + i + size);
+    i += size;
+    batchSize = std::min(batchSize * 2, EPG_CHANNELS_PER_REQUEST);
   }
 
   const size_t batches = queue.size();
@@ -2078,6 +2212,10 @@ void CPVREon::StartEpgPrefetch(int firstChannelUid, time_t start, time_t end)
     ++m_epgPrefetch.generation;
     m_epgPrefetch.stop = false;
     m_epgPrefetch.running = true;
+    m_epgPrefetch.fullWindow = fullWindow;
+    m_epgPrefetch.startedAt = std::chrono::steady_clock::now();
+    m_epgPrefetch.batchesLeft = batches;
+    m_epgPrefetch.entriesFetched = 0;
 
     const size_t workers = std::min(EPG_PREFETCH_THREADS, batches);
     for (size_t i = 0; i < workers; ++i)
@@ -2165,10 +2303,24 @@ void CPVREon::EpgPrefetchWorker()
       for (const int channelUid : batch)
       {
         if (fetched_ok)
+        {
+          m_epgPrefetch.entriesFetched += fetched[channelUid].size();
           m_epgPrefetch.ready[channelUid] = std::move(fetched[channelUid]);
+        }
         else
           m_epgPrefetch.failed.insert(channelUid);
         m_epgPrefetch.pending.erase(channelUid);
+      }
+
+      // Whoever lands the last batch reports the run: how long the whole
+      // guide took to pull, and how much of it there was.
+      if (m_epgPrefetch.batchesLeft > 0 && --m_epgPrefetch.batchesLeft == 0)
+      {
+        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - m_epgPrefetch.startedAt);
+        kodi::Log(ADDON_LOG_INFO, "EPG prefetch finished. entries=%zu failed=%zu elapsed=%lldms",
+                  m_epgPrefetch.entriesFetched, m_epgPrefetch.failed.size(),
+                  static_cast<long long>(elapsed.count()));
       }
     }
     m_epgPrefetch.cv.notify_all();
@@ -2234,9 +2386,37 @@ bool CPVREon::TakePrefetchedEpg(int channelUid,
   entries = std::move(it->second);
   m_epgPrefetch.ready.erase(it);
 
+  // Kodi walks the channels one at a time and does its own work on each
+  // answer, so the pass goes on well past the point where the fetching is
+  // done. Reporting when the last channel is collected, next to the line
+  // saying when the fetch finished, is what tells the two apart.
+  bool passDeliveredFullWindow = false;
+  if (m_epgPrefetch.ready.empty() && m_epgPrefetch.pending.empty() &&
+      m_epgPrefetch.queue.empty())
+  {
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - m_epgPrefetch.startedAt);
+    kodi::Log(ADDON_LOG_INFO, "EPG prefetch fully collected by Kodi. elapsed=%lldms full=%s",
+              static_cast<long long>(elapsed.count()), BoolState(m_epgPrefetch.fullWindow));
+    passDeliveredFullWindow = m_epgPrefetch.fullWindow && m_epgPrefetch.failed.empty();
+  }
+
   // Collecting one frees a slot under EPG_PREFETCH_MAX_READY.
   lock.unlock();
   m_epgPrefetch.cv.notify_all();
+
+  // Kodi has now taken every channel of a pass that carried the whole window,
+  // so the next refresh may leave the history to it. Recorded off the prefetch
+  // lock: it writes a file, and the workers have no reason to wait for that.
+  if (passDeliveredFullWindow)
+  {
+    const time_t now = time(nullptr);
+    m_epgFullPassAt = now;
+    m_epgFullPassChannels = m_channels.size();
+    m_epgFullPassPast = now > start ? now - start : 0;
+    SaveEpgDeliveryState();
+  }
+
   return true;
 }
 
@@ -2255,15 +2435,19 @@ PVR_ERROR CPVREon::GetEPGForChannel(int channelUid,
   if (!known_channel)
     return PVR_ERROR_NO_ERROR;
 
-  kodi::Log(ADDON_LOG_DEBUG, "EPG Request for Channel %u Start %u End %u", channelUid, start, end);
+  // Kodi asks for its whole guide window every time; what we actually have to
+  // fetch and deliver may be a shorter one -- see EpgFetchStart().
+  const time_t fetchStart = EpgFetchStart(start, end);
 
-  StartEpgPrefetch(channelUid, start, end);
+  kodi::Log(ADDON_LOG_DEBUG, "EPG Request for Channel %u Start %u End %u", channelUid, fetchStart, end);
+
+  StartEpgPrefetch(channelUid, fetchStart, end, fetchStart == start);
 
   std::vector<EonEpgEntry> entries;
-  if (!TakePrefetchedEpg(channelUid, start, end, entries))
+  if (!TakePrefetchedEpg(channelUid, fetchStart, end, entries))
   {
     std::map<int, std::vector<EonEpgEntry>> fetched;
-    if (!FetchEpgEntries({channelUid}, start, end, fetched))
+    if (!FetchEpgEntries({channelUid}, fetchStart, end, fetched))
       return PVR_ERROR_SERVER_ERROR;
 
     entries = std::move(fetched[channelUid]);

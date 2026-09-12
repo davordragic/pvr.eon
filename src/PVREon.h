@@ -6,6 +6,7 @@
  *  See LICENSE.md for more information.
  */
 
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -33,6 +34,13 @@ static const int PLATFORM_ANDROIDTV = 1;
 // per-channel arrays come back keyed by channel id -- but rejects more ids
 // than this in one request with HTTP 400 invalid_input.
 static const size_t EPG_CHANNELS_PER_REQUEST = 15;
+// Channels in the first prefetch request. Kodi is already blocked on one
+// channel when the prefetch starts, and it walks the guide faster than
+// full-size batches come back, so the first requests are deliberately small
+// and double in size until they reach EPG_CHANNELS_PER_REQUEST. Measured on
+// the Android box, the first two channels Kodi asked for cost it 5.7s and
+// 5.1s of waiting with uniform batches of fifteen.
+static const size_t EPG_FIRST_BATCH_CHANNELS = 2;
 // Worker threads filling the prefetch. Measured against the live backend over
 // a 10 day window for 289 channels: ~37s one channel per request (what Kodi
 // asks for on its own), ~22s batched, ~5s batched across four threads, and
@@ -54,6 +62,13 @@ static const size_t EPG_PREFETCH_TRIGGER_CHANNELS = 3;
 // Safety net for a batch that never lands (dead network): the caller falls
 // back to fetching its own channel, which then reports the error as before.
 static const int EPG_PREFETCH_TIMEOUT_SECONDS = 60;
+// How much of the already-aired guide a refresh hands to Kodi again once it
+// has been given the full history at least once. Kodi never drops a programme
+// because the add-on stopped sending it -- it only ages tags out past
+// `pastdaystodisplay` -- so re-sending a week of programmes that have already
+// aired and can no longer change is work neither side needs to repeat. A day
+// is kept as slack for a schedule that shifted right at the boundary.
+static const time_t EPG_INCREMENTAL_PAST = 24 * 60 * 60;
 
 // One programme, holding just the fields the add-on passes on to Kodi.
 // Deliberately not a kodi::addon::PVREPGTag: copying one of those copies the
@@ -388,6 +403,13 @@ private:
     time_t observedStart = 0;
     time_t observedEnd = 0;
     size_t waiters = 0;
+    // Batches still to land, and what they have brought in so far, so the
+    // worker that finishes the last one can report what the whole refresh
+    // cost. Without that the log shows a prefetch starting and never says
+    // when -- or whether -- it got there.
+    std::chrono::steady_clock::time_point startedAt;
+    size_t batchesLeft = 0;
+    size_t entriesFetched = 0;
     // Bumped every time a prefetch is (re)started. A caller can be waiting on
     // a channel while a new update pass replaces the prefetch underneath it;
     // comparing generations is how it notices, rather than being handed
@@ -395,11 +417,32 @@ private:
     uint64_t generation = 0;
     bool running = false;
     bool stop = false;
+    // Whether this pass is handing Kodi the whole window Kodi asked for. Only
+    // a full one may be recorded as having delivered the history.
+    bool fullWindow = false;
   };
   EonEpgPrefetch m_epgPrefetch;
   // Serialises starting and stopping the prefetch as a whole, so two update
   // passes arriving together cannot both tear down and rebuild it.
   std::mutex m_epgPrefetchLifecycle;
+
+  // When the add-on last handed Kodi the full guide window, and for how many
+  // channels. Persisted, because the refresh that matters is the one right
+  // after Kodi starts -- exactly when in-memory state is gone. A different
+  // channel count means channels whose history Kodi cannot have, so that
+  // forces a full window too.
+  time_t m_epgFullPassAt = 0;
+  size_t m_epgFullPassChannels = 0;
+  // How much history that pass carried, so that raising `pastdaystodisplay`
+  // is not mistaken for history Kodi already has.
+  time_t m_epgFullPassPast = 0;
+  // The window Kodi is currently asking for and the start we resolved for it.
+  // Held so every channel of a pass is fetched and served over one window --
+  // recomputing per channel would drift and leave the prefetch unusable.
+  std::mutex m_epgWindowMutex;
+  time_t m_epgWindowStart = 0;
+  time_t m_epgWindowEnd = 0;
+  time_t m_epgFetchStart = 0;
 
   std::string m_service_provider;
   std::string m_support_web;
@@ -421,12 +464,15 @@ private:
 
   std::string GetTime();
   int getBitrate(const bool isRadio, const int id);
+  void LoadEpgDeliveryState();
+  void SaveEpgDeliveryState();
+  time_t EpgFetchStart(time_t start, time_t end);
   EonEpgEntry ParseEpgEntry(const rapidjson::Value& epgItem) const;
   bool FetchEpgEntries(const std::vector<int>& channelUids,
                        time_t start,
                        time_t end,
                        std::map<int, std::vector<EonEpgEntry>>& entries);
-  void StartEpgPrefetch(int firstChannelUid, time_t start, time_t end);
+  void StartEpgPrefetch(int firstChannelUid, time_t start, time_t end, bool fullWindow);
   void StopEpgPrefetch();
   void EpgPrefetchWorker();
   bool TakePrefetchedEpg(int channelUid,
